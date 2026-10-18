@@ -1,0 +1,85 @@
+name: Build Test ISO
+permissions:
+  contents: read
+  packages: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: 'Variant to build'
+        required: true
+        default: 'yellowfin'
+        type: choice
+        options:
+          - yellowfin
+          - albacore
+          - bonito
+          - skipjack
+      flavor:
+        description: 'Desktop flavor'
+        required: true
+        default: 'cosmic'
+        type: string
+
+jobs:
+  build-iso:
+    name: Build Test ISO
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y just jq rclone golang-go git systemd-boot-efi mtools squashfs-tools xorriso dosfstools gdisk e2fsprogs btrfs-progs
+
+      - name: Setup working podman
+        run: |
+          set -euo pipefail
+          sudo install -d /etc/apt/keyrings
+          curl -fsSL https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/unstable/xUbuntu_24.04/Release.key \
+            | gpg --dearmor | sudo tee /etc/apt/keyrings/kubic.gpg >/dev/null
+          echo 'deb [signed-by=/etc/apt/keyrings/kubic.gpg] https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/unstable/xUbuntu_24.04/ /' \
+            | sudo tee /etc/apt/sources.list.d/kubic.list
+          sudo apt-get update -qq
+          sudo apt-get remove -y podman conmon crun || true
+          sudo apt-get install -y podman
+          for p in /usr/local/bin/podman /usr/local/sbin/podman; do
+            if [ -e "$p" ] && ! dpkg -S "$p" >/dev/null 2>&1; then
+              sudo rm -f "$p"
+            fi
+          done
+          hash -r
+
+      - name: Setup rootless podman namespaces
+        run: |
+          set -euo pipefail
+          if ! grep -q "^${USER}:" /etc/subuid 2>/dev/null; then
+            echo "${USER}:100000:65536" | sudo tee -a /etc/subuid
+          fi
+          if ! grep -q "^${USER}:" /etc/subgid 2>/dev/null; then
+            echo "${USER}:100000:65536" | sudo tee -a /etc/subgid
+          fi
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          podman unshare true
+
+      - name: Build Live ISO with Tacklebox from GHCR
+        env:
+          TACKLEBOX_FROM_SOURCE: "1"
+        run: |
+          sudo -E env "PATH=$PATH" just iso "${{ inputs.variant }}" "${{ inputs.flavor }}" ghcr "${{ inputs.flavor }}"
+
+      - name: Upload ISO Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.variant }}-${{ inputs.flavor }}-test-iso
+          path: "*.iso"
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
